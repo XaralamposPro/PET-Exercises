@@ -133,6 +133,28 @@ def mix_client_one_hop(public_key, address, message):
     client_public_key  = private_key * G.generator()
 
     ## ADD CODE HERE
+    
+    ## Create a new shared key using the given public key and 
+    ## the freshly created private key
+    shared_element = private_key * public_key
+    key_material = sha512(shared_element.export()).digest()
+
+    # Use different parts of the shared key for different operations
+    hmac_key = key_material[:16]
+    address_key = key_material[16:32]
+    message_key = key_material[32:48]
+
+    ## Encrypt the address and the message
+    iv = b"\x00"*16
+    address_cipher = aes_ctr_enc_dec(address_key, iv, address_plaintext)
+    message_cipher = aes_ctr_enc_dec(message_key, iv, message_plaintext)
+
+    ## Create the expected HMAC
+    h = Hmac(b"sha512", hmac_key)        
+    h.update(address_cipher)
+    h.update(message_cipher)
+    expected_mac = h.digest()
+    expected_mac = expected_mac[:20]
 
     return OneHopMixMessage(client_public_key, expected_mac, address_cipher, message_cipher)
 
@@ -259,9 +281,65 @@ def mix_client_n_hop(public_keys, address, message):
 
     ## Generate a fresh public key
     private_key = G.order().random()
-    client_public_key  = private_key * G.generator()
+    client_public_key = private_key * G.generator()
 
     ## ADD CODE HERE
+
+    key_materials = []
+    hmacs = []
+
+    ## Will be used to keep the client's key blinded
+    blinded_private_key = private_key
+
+    ## Initialize the address_cipher and message_cipher with the plaintexts
+    address_cipher = address_plaintext
+    message_cipher = message_plaintext
+
+    ## Create a new shared key for each mix using the given public keys and 
+    ## the freshly created blinded private key
+    for i in range(len(public_keys)):
+    	shared_element = blinded_private_key * public_keys[i]
+    	current_key_material = sha512(shared_element.export()).digest()
+    	key_materials.insert(0, current_key_material)
+
+    	## Extract a blinding factor for the private key
+        blinding_factor = Bn.from_binary(current_key_material[48:])
+        blinded_private_key = blinded_private_key * blinding_factor
+
+	## Reverse the list with public keys
+	public_keys = public_keys[::-1]
+
+	## Encapsulate the address and message cipher in a reversed orded 
+	## such that the first address and message to be encrypted used 
+	## by the last mixer and the last ones used by the first mixer.    
+    for i in range(len(public_keys)):	
+
+    	## Use different parts of the shared key for different operations
+    	hmac_key = key_materials[i][:16]
+    	address_key = key_materials[i][16:32]
+    	message_key = key_materials[i][32:48]
+
+    	## Encrypt the address and the message for each mix with different key
+    	iv = b"\x00"*16
+    	address_cipher = aes_ctr_enc_dec(address_key, iv, address_cipher)
+    	message_cipher = aes_ctr_enc_dec(message_key, iv, message_cipher)
+
+    	## Create the expected HMAC for each mix
+    	h = Hmac(b"sha512", hmac_key)
+    	
+    	## Encrypt all other HMACs using the hmac_key of each mix
+    	for i in range(len(hmacs)):
+
+    			## Ensure the IV is different for each HMAC
+    			iv = pack("H14s", i, b"\x00"*14)
+    			hmacs[i] = aes_ctr_enc_dec(hmac_key, iv, hmacs[i])
+    			h.update(hmacs[i])
+
+    	## Add to each expected HMAC the address and message cipher
+    	h.update(address_cipher)
+    	h.update(message_cipher)
+    	## List the expected HMAC for each mix
+    	hmacs.insert(0, h.digest()[:20])
 
     return NHopMixMessage(client_public_key, hmacs, address_cipher, message_cipher)
 
@@ -312,18 +390,54 @@ def analyze_trace(trace, target_number_of_friends, target=0):
     """
 
     ## ADD CODE HERE
+    c = Counter()
+    target_friends = []
 
-    return []
+    ## From all messages in trace choose only the messages that the target (Alice) is the sender    
+    for sender, receiver in trace:
+    	if target in sender:
+    		c = c + Counter(receiver)
+
+    ## Sort the receivers by the frequency that Alice have sent them a message and choose the first target_number_of_friends 
+    c = c.most_common(target_number_of_friends)
+
+    ## List the target's friends created in c
+    for i, count in c:
+    	target_friends.insert(0, i)
+
+    ## Return the target's friends
+    return target_friends
 
 ## TASK Q1 (Question 1): The mix packet format you worked on uses AES-CTR with an IV set to all zeros. 
 #                        Explain whether this is a security concern and justify your answer.
 
-""" TODO: Your answer HERE """
+""" 
+For AES-CTR mode the secure encryption relies on the usage of a unique IV and key for each message, 
+otherwise two messages with the same plaintext will result to the same ciphertext, leaking information to an attacker.
+However, in our case, since we use different key for each message the use of the same IV is secure. Furthermore, the use 
+of an IV set to all zeros is safe as the IV's only purpose is to ensure that a different ciphertext will be produced even  
+with the same plaintext. In addition, in AES-CTR mode, the secrecy of the IV is not a security requirement.
+Conclusively, the content of the IV does not affect the security as long as a unique IV and key is 
+used for the encryption of a plaintext.
+
+"""
+
 
 
 ## TASK Q2 (Question 2): What assumptions does your implementation of the Statistical Disclosure Attack 
 #                        makes about the distribution of traffic from non-target senders to receivers? Is
 #                        the correctness of the result returned dependent on this background distribution?
 
-""" TODO: Your answer HERE """
+""" 
+For our Statistical Disclosure Attack we assume that non-target senders do not send equal or more traffic to non-target's friends
+than the target at the same time. In out Attack we analyze all the messages that were sent by the target and at the same time 
+the receivers that received the highest number of messages. We then assume that the receivers were the target's friends. However,
+in the case that, simultaneously, non-target senders send a higher amount of messages to some random receivers than the target sends 
+to his/her friends, we would then wrongly choose some random receivers as the target's friends. If, for example, our target Alice 
+sends a message to her friend Bob and at the same time Charlie sends a high amount of messages to Dave, from our Statistical Disclosure 
+Attack we would wrongly see Dave as target's friend. Consequently, the above assumption is critical for the correctness of the Attack's 
+result and if this assumption doesn't hold we would be misinformed about target's friends.
+
+
+"""
 
